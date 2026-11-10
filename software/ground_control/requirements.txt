@@ -1,0 +1,7 @@
+||======PYTHON DEPENDENCIES FOR PY CODE======||
+
+		pyserial
+		matplotlib
+		tkintermapview
+
+||===========================================||
