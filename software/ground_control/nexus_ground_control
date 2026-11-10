@@ -1,0 +1,673 @@
+
+import tkinter as tk
+import serial
+import csv
+import threading
+import queue
+import time
+from collections import deque
+from tkintermapview import TkinterMapView
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+# ==========================================
+# NEXUS CONFIGURATION
+# ==========================================
+
+PORT = "COM8"
+BAUD = 9600
+MAX_POINTS = 100
+
+BG = "#101722"
+PANEL = "#1a2635"
+CYAN = "#00d5ff"
+GREEN = "#00e676"
+RED = "#ff5252"
+WHITE = "#edf4ff"
+MUTED = "#91a4b9"
+
+data_queue = queue.Queue()
+stop_event = threading.Event()
+
+serial_connection = None
+reader_thread = None
+running = False
+map_marker = None
+last_map_center = None
+
+times = deque(maxlen=MAX_POINTS)
+
+accel_x = deque(maxlen=MAX_POINTS)
+accel_y = deque(maxlen=MAX_POINTS)
+accel_z = deque(maxlen=MAX_POINTS)
+
+gyro_x = deque(maxlen=MAX_POINTS)
+gyro_y = deque(maxlen=MAX_POINTS)
+gyro_z = deque(maxlen=MAX_POINTS)
+
+mag_x = deque(maxlen=MAX_POINTS)
+mag_y = deque(maxlen=MAX_POINTS)
+mag_z = deque(maxlen=MAX_POINTS)
+
+
+# ==========================================
+# WINDOW
+# ==========================================
+
+root = tk.Tk()
+root.title("NEXUS | Ground Control Station")
+root.geometry("1400x1050")
+root.minsize(1100, 800)
+root.configure(bg=BG)
+
+
+def label(parent, text, size=11, color=WHITE, bold=False):
+    return tk.Label(
+        parent,
+        text=text,
+        font=("Consolas", size, "bold" if bold else "normal"),
+        fg=color,
+        bg=parent["bg"]
+    )
+
+
+def panel(parent):
+    return tk.Frame(
+        parent,
+        bg=PANEL,
+        highlightbackground="#30445a",
+        highlightthickness=1
+    )
+
+
+# ==========================================
+# HEADER
+# ==========================================
+
+header = tk.Frame(root, bg=BG)
+header.pack(fill="x", padx=20, pady=12)
+
+label(header, "NEXUS", 27, CYAN, True).pack(side="left")
+
+label(
+    header,
+    "// GROUND CONTROL STATION",
+    13,
+    WHITE,
+    True
+).pack(side="left", padx=15, pady=(12, 0))
+
+connection_status = label(
+    header,
+    "● DISCONNECTED",
+    12,
+    RED,
+    True
+)
+connection_status.pack(side="right", pady=12)
+
+
+# ==========================================
+# CONTROLS
+# ==========================================
+
+controls = tk.Frame(root, bg=BG)
+controls.pack(fill="x", padx=20, pady=5)
+
+start_button = tk.Button(
+    controls,
+    text="START DISPLAY",
+    font=("Consolas", 12, "bold"),
+    bg=GREEN,
+    fg="#07130c",
+    relief="flat",
+    padx=25,
+    pady=12
+)
+start_button.pack(side="left", padx=(0, 10))
+
+stop_button = tk.Button(
+    controls,
+    text="END DISPLAY",
+    font=("Consolas", 12, "bold"),
+    bg="#344357",
+    fg=WHITE,
+    relief="flat",
+    padx=25,
+    pady=12,
+    state="disabled"
+)
+stop_button.pack(side="left")
+
+label(
+    controls,
+    "BLUETOOTH: COM8 | 9600 BAUD",
+    11,
+    MUTED
+).pack(side="right", pady=12)
+
+
+# ==========================================
+# GPS INFORMATION
+# ==========================================
+
+gps_panel = panel(root)
+gps_panel.pack(fill="x", padx=20, pady=7)
+
+label(
+    gps_panel,
+    "GPS POSITIONING",
+    13,
+    CYAN,
+    True
+).pack(anchor="w", padx=15, pady=(12, 5))
+
+gps_grid = tk.Frame(gps_panel, bg=PANEL)
+gps_grid.pack(fill="x", padx=15, pady=(0, 12))
+
+gps_values = {}
+
+gps_fields = [
+    ("GPS STATUS", "SEARCHING"),
+    ("LATITUDE", "---"),
+    ("LONGITUDE", "---"),
+    ("ALTITUDE (m)", "---"),
+    ("SATELLITES", "---")
+]
+
+for i, (name, initial) in enumerate(gps_fields):
+    cell = tk.Frame(gps_grid, bg=PANEL)
+    cell.grid(row=0, column=i, sticky="ew", padx=8)
+    gps_grid.columnconfigure(i, weight=1)
+
+    label(cell, name, 9, MUTED).pack(anchor="w")
+
+    value = label(
+        cell,
+        initial,
+        15,
+        GREEN if i == 0 else WHITE,
+        True
+    )
+    value.pack(anchor="w", pady=5)
+
+    gps_values[name] = value
+
+
+# ==========================================
+# LIVE GPS MAP
+# ==========================================
+
+map_panel = panel(root)
+map_panel.pack(fill="x", padx=20, pady=7)
+
+map_header = tk.Frame(map_panel, bg=PANEL)
+map_header.pack(fill="x", padx=15, pady=10)
+
+label(
+    map_header,
+    "LIVE GPS LOCATION",
+    13,
+    CYAN,
+    True
+).pack(side="left")
+
+map_status = label(
+    map_header,
+    "WAITING FOR GPS FIX",
+    10,
+    MUTED
+)
+map_status.pack(side="right")
+
+map_widget = TkinterMapView(
+    map_panel,
+    width=1200,
+    height=260,
+    corner_radius=5
+)
+
+map_widget.pack(
+    fill="x",
+    padx=10,
+    pady=(0, 10)
+)
+
+map_widget.set_position(36.123345, -97.061947)
+map_widget.set_zoom(15)
+
+
+# ==========================================
+# IMU INFORMATION
+# ==========================================
+
+imu_container = tk.Frame(root, bg=BG)
+imu_container.pack(fill="x", padx=20, pady=7)
+
+imu_fields = [
+    ("ACCELERATION", ["X (m/s²)", "Y (m/s²)", "Z (m/s²)"]),
+    ("GYROSCOPE", ["X (rad/s)", "Y (rad/s)", "Z (rad/s)"]),
+    ("MAGNETOMETER", ["X (µT)", "Y (µT)", "Z (µT)"])
+]
+
+imu_values = {}
+
+for i, (title, fields) in enumerate(imu_fields):
+
+    p = panel(imu_container)
+    p.grid(row=0, column=i, sticky="nsew", padx=5)
+    imu_container.columnconfigure(i, weight=1)
+
+    label(p, title, 12, CYAN, True).pack(
+        anchor="w", padx=12, pady=(12, 8)
+    )
+
+    for field in fields:
+        row = tk.Frame(p, bg=PANEL)
+        row.pack(fill="x", padx=12, pady=5)
+
+        label(row, field, 10, MUTED).pack(side="left")
+
+        value = label(row, "---", 11, WHITE, True)
+        value.pack(side="right")
+
+        imu_values[field] = value
+
+
+# ==========================================
+# LIVE GRAPHS
+# ==========================================
+
+graph_panel = panel(root)
+graph_panel.pack(
+    fill="both",
+    expand=True,
+    padx=20,
+    pady=7
+)
+
+label(
+    graph_panel,
+    "LIVE SENSOR TELEMETRY",
+    13,
+    CYAN,
+    True
+).pack(anchor="w", padx=15, pady=10)
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 2.7))
+fig.patch.set_facecolor(PANEL)
+
+graph_info = [
+    (axes[0], "Acceleration", "m/s²"),
+    (axes[1], "Gyroscope", "rad/s"),
+    (axes[2], "Magnetometer", "µT")
+]
+
+for ax, title, unit in graph_info:
+    ax.set_facecolor("#111d2b")
+    ax.set_title(title, color="white", fontsize=10)
+    ax.set_ylabel(unit, color="white", fontsize=8)
+    ax.set_xlabel("Time (s)", color="white", fontsize=8)
+    ax.tick_params(colors="white", labelsize=7)
+    ax.grid(True, alpha=0.2)
+
+    for spine in ax.spines.values():
+        spine.set_color("#40536b")
+
+lines = []
+graph_colors = [CYAN, GREEN, "#ffb74d"]
+
+for ax, title, unit in graph_info:
+    group = []
+
+    for color in graph_colors:
+        line, = ax.plot([], [], color=color, linewidth=1.5)
+        group.append(line)
+
+    ax.legend(
+        ["X", "Y", "Z"],
+        loc="upper right",
+        fontsize=7,
+        facecolor=PANEL,
+        labelcolor="white"
+    )
+
+    lines.append(group)
+
+fig.tight_layout(pad=2)
+
+canvas = FigureCanvasTkAgg(fig, master=graph_panel)
+canvas.get_tk_widget().pack(
+    fill="both",
+    expand=True,
+    padx=8,
+    pady=(0, 8)
+)
+
+
+# ==========================================
+# BLUETOOTH READER
+# ==========================================
+
+def serial_reader(connection):
+
+    while not stop_event.is_set():
+
+        try:
+            raw = connection.readline()
+
+            if not raw:
+                continue
+
+            line = raw.decode(
+                "utf-8",
+                errors="replace"
+            ).strip()
+
+            if not line:
+                continue
+
+            row = next(csv.reader([line]))
+
+            if len(row) < 14:
+                continue
+
+            values = {
+                "millis": int(row[0]),
+                "lat": float(row[1]) if row[1] else None,
+                "lon": float(row[2]) if row[2] else None,
+                "alt": float(row[3]) if row[3] else None,
+                "sats": int(float(row[4])),
+                "ax": float(row[5]) if row[5] else None,
+                "ay": float(row[6]) if row[6] else None,
+                "az": float(row[7]) if row[7] else None,
+                "gx": float(row[8]) if row[8] else None,
+                "gy": float(row[9]) if row[9] else None,
+                "gz": float(row[10]) if row[10] else None,
+                "mx": float(row[11]) if row[11] else None,
+                "my": float(row[12]) if row[12] else None,
+                "mz": float(row[13]) if row[13] else None
+            }
+
+            data_queue.put(("data", values))
+
+        except (ValueError, IndexError):
+            continue
+
+        except (serial.SerialException, OSError) as error:
+            data_queue.put(("error", str(error)))
+            break
+
+
+# ==========================================
+# START / STOP
+# ==========================================
+
+def start_display():
+
+    global serial_connection
+    global reader_thread
+    global running
+
+    if running:
+        return
+
+    try:
+        serial_connection = serial.Serial(
+            PORT,
+            BAUD,
+            timeout=1
+        )
+
+        time.sleep(0.5)
+        serial_connection.reset_input_buffer()
+
+        stop_event.clear()
+
+        reader_thread = threading.Thread(
+            target=serial_reader,
+            args=(serial_connection,),
+            daemon=True
+        )
+        reader_thread.start()
+
+        running = True
+
+        connection_status.config(
+            text="● CONNECTED",
+            fg=GREEN
+        )
+
+        start_button.config(state="disabled")
+        stop_button.config(state="normal")
+
+    except serial.SerialException as error:
+        connection_status.config(
+            text="● CONNECTION FAILED",
+            fg=RED
+        )
+        print("Bluetooth error:", error)
+
+
+def stop_display():
+
+    global serial_connection
+    global running
+
+    stop_event.set()
+
+    if serial_connection:
+        try:
+            serial_connection.close()
+        except Exception:
+            pass
+
+        serial_connection = None
+
+    running = False
+
+    connection_status.config(
+        text="● DISCONNECTED",
+        fg=RED
+    )
+
+    start_button.config(state="normal")
+    stop_button.config(state="disabled")
+
+
+start_button.config(command=start_display)
+stop_button.config(command=stop_display)
+
+
+# ==========================================
+# MAP UPDATE
+# ==========================================
+
+def update_map(lat, lon):
+
+    global map_marker
+    global last_map_center
+
+    if lat is None or lon is None:
+        return
+
+    if map_marker is None:
+        map_widget.set_position(lat, lon)
+        map_widget.set_zoom(17)
+
+        map_marker = map_widget.set_marker(
+            lat,
+            lon,
+            text="NEXUS GPS LOCATION"
+        )
+
+        last_map_center = (lat, lon)
+
+    else:
+        map_marker.set_position(lat, lon)
+
+        if last_map_center is None:
+            map_widget.set_position(lat, lon)
+            last_map_center = (lat, lon)
+
+        else:
+            old_lat, old_lon = last_map_center
+
+            if (
+                abs(lat - old_lat) > 0.00003
+                or abs(lon - old_lon) > 0.00003
+            ):
+                map_widget.set_position(lat, lon)
+                last_map_center = (lat, lon)
+
+    map_status.config(
+        text=f"GPS FIX: {lat:.6f}, {lon:.6f}",
+        fg=GREEN
+    )
+
+
+# ==========================================
+# UPDATE DASHBOARD
+# ==========================================
+
+def update_display():
+
+    updated = False
+
+    while not data_queue.empty():
+
+        kind, values = data_queue.get()
+
+        if kind == "error":
+            connection_status.config(
+                text="● SERIAL ERROR",
+                fg=RED
+            )
+            stop_display()
+            continue
+
+        lat = values["lat"]
+        lon = values["lon"]
+
+        gps_locked = lat is not None and lon is not None
+
+        gps_values["GPS STATUS"].config(
+            text="LOCKED" if gps_locked else "SEARCHING",
+            fg=GREEN if gps_locked else "#ffb74d"
+        )
+
+        gps_data = {
+            "LATITUDE": lat,
+            "LONGITUDE": lon,
+            "ALTITUDE (m)": values["alt"],
+            "SATELLITES": values["sats"]
+        }
+
+        for name, value in gps_data.items():
+            if value is None:
+                display_value = "---"
+            elif name == "SATELLITES":
+                display_value = str(value)
+            else:
+                display_value = f"{value:.6f}"
+
+            gps_values[name].config(text=display_value)
+
+        if gps_locked:
+            update_map(lat, lon)
+        else:
+            map_status.config(
+                text="WAITING FOR GPS FIX",
+                fg=MUTED
+            )
+
+        imu_data = {
+            "X (m/s²)": values["ax"],
+            "Y (m/s²)": values["ay"],
+            "Z (m/s²)": values["az"],
+            "X (rad/s)": values["gx"],
+            "Y (rad/s)": values["gy"],
+            "Z (rad/s)": values["gz"],
+            "X (µT)": values["mx"],
+            "Y (µT)": values["my"],
+            "Z (µT)": values["mz"]
+        }
+
+        for name, value in imu_data.items():
+            imu_values[name].config(
+                text="---" if value is None else f"{value:.3f}"
+            )
+
+        times.append(values["millis"] / 1000.0)
+
+        series = [
+            (accel_x, "ax"), (accel_y, "ay"), (accel_z, "az"),
+            (gyro_x, "gx"), (gyro_y, "gy"), (gyro_z, "gz"),
+            (mag_x, "mx"), (mag_y, "my"), (mag_z, "mz")
+        ]
+
+        for collection, key in series:
+            value = values[key]
+            collection.append(
+                float("nan") if value is None else value
+            )
+
+        updated = True
+
+    if updated and times:
+
+        graph_data = [
+            [accel_x, accel_y, accel_z],
+            [gyro_x, gyro_y, gyro_z],
+            [mag_x, mag_y, mag_z]
+        ]
+
+        for group, series_group in zip(lines, graph_data):
+            for line, series in zip(group, series_group):
+                line.set_data(times, series)
+
+        for ax in axes:
+            ax.relim()
+            ax.autoscale_view()
+
+        canvas.draw_idle()
+
+    root.after(100, update_display)
+
+
+# ==========================================
+# FOOTER
+# ==========================================
+
+footer = tk.Frame(root, bg=BG)
+footer.pack(fill="x", padx=20, pady=8)
+
+label(
+    footer,
+    "NEXUS // GPS + INERTIAL TELEMETRY SYSTEM",
+    9,
+    MUTED
+).pack(side="left")
+
+label(
+    footer,
+    "USB | BLUETOOTH | SD",
+    9,
+    CYAN
+).pack(side="right")
+
+
+# ==========================================
+# SHUTDOWN
+# ==========================================
+
+def on_close():
+    stop_display()
+    root.destroy()
+
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+
+root.after(100, update_display)
+
+root.mainloop()
