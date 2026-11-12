@@ -205,7 +205,7 @@ The current application has been tested using the HC-05 Bluetooth serial connect
 | Device enclosure | Completed |
 | Fabricated PCB | In development |
 | Extended runtime testing | Pending |
-| USB GUI integration | Pending |
+| USB GUI integration | Completed |
 
 ## Future Development
 
